@@ -1177,6 +1177,7 @@
 									</div>
 								</div>
 								<div class="p-6 flex flex-col gap-6">
+									<ProductLabelSettings v-model="productLabelConfig" :pos-profile="props.posProfile" />
 									<!-- Queue Number -->
 									<div :class="queueSubsectionClasses.container">
 										<div class="flex items-center gap-2 mb-4">
@@ -1661,6 +1662,8 @@ import RefreshButton from "@/components/common/RefreshButton.vue";
 import CheckboxField from "@/components/settings/CheckboxField.vue";
 import NumberField from "@/components/settings/NumberField.vue";
 import SelectField from "@/components/settings/SelectField.vue";
+import ProductLabelSettings from "@/components/settings/ProductLabelSettings.vue";
+import { loadLabelConfig, saveLabelConfig } from "@/utils/print/product_label";
 import { useToast } from "@/composables/useToast";
 import { Button, call, createResource } from "frappe-ui";
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
@@ -1703,6 +1706,10 @@ const tabs = computed(() => [
 const activeTab = ref("stock");
 const loading = ref(true);
 const saving = ref(false);
+const productLabelConfig = ref(loadLabelConfig(props.posProfile));
+watch(() => props.posProfile, (profile) => {
+	productLabelConfig.value = loadLabelConfig(profile);
+});
 const warehousesList = ref([]);
 const selectedWarehouse = ref(props.currentWarehouse || "");
 const settings = ref({
@@ -2010,6 +2017,13 @@ async function saveSettings() {
 			settings.value.pos_profile = props.posProfile;
 			// Update original values after successful save
 			originalTaxInclusive.value = result.tax_inclusive;
+		}
+
+		// Label settings remain device-local and never enter the server payload.
+		// Save from any tab; the dedicated label button remains available too.
+		// Skip unchanged drafts so legacy saves do not require browser storage.
+		if (JSON.stringify(productLabelConfig.value) !== JSON.stringify(loadLabelConfig(props.posProfile))) {
+			productLabelConfig.value = saveLabelConfig(props.posProfile, productLabelConfig.value);
 		}
 
 		// Print knobs live in the transport singleton, which is loaded once

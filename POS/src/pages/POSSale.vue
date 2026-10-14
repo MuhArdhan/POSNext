@@ -933,12 +933,22 @@
 						<p class="mt-2 text-sm text-gray-500">
 							{{ __("Paid: {0}", [formatCurrency(uiStore.lastPaidAmount)]) }}
 						</p>
+						<p v-if="lastProductLabelInvoice?.name === uiStore.lastInvoiceName && productLabelMessage" class="mt-2 text-sm text-indigo-700">
+							{{ productLabelMessage }}
+						</p>
 					</div>
 				</template>
 				<template #actions>
 					<div class="flex gap-2">
 						<Button variant="subtle" @click="uiStore.showSuccessDialog = false">
 							{{ __("Close") }}
+						</Button>
+						<Button
+							v-if="lastProductLabelInvoice?.name === uiStore.lastInvoiceName"
+							:disabled="productLabelsPrinting"
+							@click="handleReprintProductLabels"
+						>
+							{{ __("Print Product Labels") }}
 						</Button>
 						<Button
 							v-if="!posSettingsStore.isPrintOff"
@@ -1079,6 +1089,7 @@ import {
 } from "@/utils/printInvoice";
 import { qzConnected, connect as qzConnect, disconnect as qzDisconnect } from "@/utils/qzTray";
 import { ensureIminSdk, getTransport } from "@/utils/print/transport";
+import { loadLabelConfig } from "@/utils/print/product_label";
 
 import { Button, Dialog, createResource } from "frappe-ui";
 import { call } from "@/utils/apiWrapper";
@@ -2338,6 +2349,10 @@ async function handlePaymentCompleted(paymentData) {
 			return;
 		}
 
+		// Optional label lane: capture product/customer data BEFORE submission resets
+		// the cart. Disabled devices do not perform any label work or QZ requests.
+		const productLabelSnapshot = captureProductLabelCheckout(paymentData);
+
 		cartStore.payments = [];
 		if (paymentData.payments && Array.isArray(paymentData.payments)) {
 			paymentData.payments.forEach((p) => {
@@ -2505,6 +2520,9 @@ async function handlePaymentCompleted(paymentData) {
 				offlinePrintDoc.pos_queue_number || null,
 			);
 			showSuccess(__("Invoice saved offline. Will sync when online"));
+			if (productLabelSnapshot && offlinePrintDoc.outstanding_amount < 0.01) {
+				startProductLabels({ ...productLabelSnapshot, ...offlinePrintDoc, items: productLabelSnapshot.items });
+			}
 
 			if (posSettingsStore.isPrintAuto) {
 				handlePrintInvoice({ name: offlineReceiptName }).catch((error) => {
@@ -2528,6 +2546,13 @@ async function handlePaymentCompleted(paymentData) {
 
 			if (result) {
 				uiStore.clearLastOfflinePrintDoc();
+				if (productLabelSnapshot && (result.status === 1 || result.docstatus === 1) && Number(result.outstanding_amount ?? 0) < 0.01) {
+					startProductLabels({
+						...productLabelSnapshot,
+						name: result.name || result.message?.name,
+						pos_queue_number: result.pos_queue_number ?? null,
+					});
+				}
 
 				// If this online checkout originated from editing a still-queued
 				// offline invoice, mark the original row as superseded so the
@@ -3506,6 +3531,73 @@ async function loadInvoiceHistoryData() {
 function handleViewInvoice(invoice) {
 	selectedInvoiceForView.value = invoice.name || invoice;
 	showInvoiceDetail.value = true;
+}
+
+// Product labels are deliberately independent of receipt mode/driver/fallback.
+const lastProductLabelInvoice = ref(null);
+const productLabelsPrinting = ref(false);
+const productLabelMessage = ref("");
+const productLabelsSent = ref(false);
+
+function captureProductLabelCheckout(paymentData) {
+	try {
+		const config = loadLabelConfig(cartStore.posProfile);
+		if (!config.enabled || paymentData.is_credit_sale || posSettingsStore.createOnlySalesOrder) return null;
+		const now = new Date();
+		return JSON.parse(JSON.stringify({
+			pos_profile: cartStore.posProfile,
+			company: shiftStore.profileCompany,
+			customer: cartStore.customer?.name || cartStore.customer || shiftStore.profileCustomer,
+			customer_name: cartStore.customer?.customer_name || "",
+			buyer_name: cartStore.buyerName || "",
+			posting_date: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`,
+			posting_time: now.toLocaleTimeString("en-GB", { hour12: false }),
+			items: cartStore.invoiceItems.map((item) => ({ ...item, qty: item.quantity ?? item.qty })),
+		}));
+	} catch (error) {
+		log.warn("Product label snapshot unavailable:", error);
+		return null;
+	}
+}
+
+function startProductLabels(invoice) {
+	lastProductLabelInvoice.value = invoice;
+	productLabelsSent.value = false;
+	// Never await the printer inside the payment transaction; all failures are
+	// handled here, so a successful sale cannot be reported as a failed checkout.
+	void handlePrintProductLabels(invoice);
+}
+
+async function handlePrintProductLabels(invoice, reprint = false) {
+	productLabelsPrinting.value = true;
+	productLabelMessage.value = __("Sending product labels...");
+	try {
+		const { productLabelPrinter } = await import("@/utils/print/product_label_qz");
+		const result = await productLabelPrinter.print(invoice, loadLabelConfig(invoice.pos_profile), { reprint });
+		if (lastProductLabelInvoice.value?.name !== invoice.name) return;
+		productLabelsSent.value = result.status === "sent" || result.status === "already-sent";
+		productLabelMessage.value = result.status === "sent"
+			? ""
+			: result.status === "empty" ? __("No products matched the label settings")
+			: result.status === "disabled" ? __("Product label printing is disabled")
+			: __("Product labels already sent");
+	} catch (error) {
+		log.warn("Product label print failed (sale preserved):", error);
+		if (lastProductLabelInvoice.value?.name === invoice.name) {
+			productLabelMessage.value = __("Sale completed, but labels could not be printed: {0}", [error.message]);
+			showWarning(productLabelMessage.value);
+		}
+	} finally {
+		if (lastProductLabelInvoice.value?.name === invoice.name) productLabelsPrinting.value = false;
+	}
+}
+
+function handleReprintProductLabels() {
+	if (productLabelsPrinting.value || !lastProductLabelInvoice.value) return;
+	if (!window.confirm(productLabelsSent.value
+		? __("Labels were already sent. Print another copy?")
+		: __("Check the printer first: a failed job may have printed some labels. Send this label job again?"))) return;
+	void handlePrintProductLabels(lastProductLabelInvoice.value, true);
 }
 
 // Centralized print handler - uses printInvoice.js utilities

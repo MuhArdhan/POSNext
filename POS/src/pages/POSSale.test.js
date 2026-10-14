@@ -19,6 +19,8 @@ import { createPinia, setActivePinia } from "pinia"
 import { defineComponent, reactive } from "vue"
 
 const resources = vi.hoisted(() => ({ instances: [] }))
+const labelPrintMock = vi.hoisted(() => vi.fn(async () => ({ status: "sent", count: 1 })))
+vi.mock("@/utils/print/product_label_qz", () => ({ productLabelPrinter: { print: labelPrintMock } }))
 
 // IndexedDB draft store: every method becomes a resolved no-op, but saveDraft
 // records its payload so the draft round-trip tests can assert exactly what a
@@ -198,6 +200,7 @@ import { usePOSShiftStore } from "@/stores/posShift"
 import { usePOSSyncStore } from "@/stores/posSync"
 import { usePOSUIStore } from "@/stores/posUI"
 import POSSale from "./POSSale.vue"
+import { saveLabelConfig } from "@/utils/print/product_label"
 
 const CART_ITEM = {
 	item_code: "ITEM-1",
@@ -401,6 +404,65 @@ async function mountPOS(stubOverrides = {}) {
 beforeEach(() => {
 	offlineWorkerMock.saveOfflineInvoice.mockClear()
 	resources.instances.length = 0
+	localStorage.removeItem("pos_product_label_config_v1:Profile 1")
+	labelPrintMock.mockClear()
+})
+
+describe("optional product label checkout lane", () => {
+	it("does not print labels by default", async () => {
+		await mountPOS()
+		await wrapper.find('[data-test="complete-payment"]').trigger("click")
+		await flushPromises()
+		expect(labelPrintMock).not.toHaveBeenCalled()
+		wrapper.unmount()
+	})
+	it("prints the paid offline snapshot once without losing cart product names", async () => {
+		await mountPOS()
+		saveLabelConfig("Profile 1", { enabled: true, printer: "LABEL" })
+		await wrapper.find('[data-test="complete-payment"]').trigger("click")
+		await vi.waitFor(() => expect(labelPrintMock).toHaveBeenCalledTimes(1))
+		const invoice = labelPrintMock.mock.calls[0][0]
+		expect(invoice.items[0].item_name).toBe("Kopi Susu")
+		expect(invoice.pos_profile).toBe("Profile 1")
+		expect(invoice.buyer_name).toBe("")
+		expect(cartStore.invoiceItems).toHaveLength(0)
+		expect(uiStore.showSuccessDialog).toBe(true)
+		wrapper.unmount()
+	})
+	it("does not print labels for partial payments", async () => {
+		await mountPOS()
+		saveLabelConfig("Profile 1", { enabled: true, printer: "LABEL" })
+		wrapper.findComponent(PaymentDialogStub).vm.$emit("payment-completed", { ...PAYMENT_PAYLOAD, paid_amount: 10000 })
+		await flushPromises()
+		expect(labelPrintMock).not.toHaveBeenCalled()
+		wrapper.unmount()
+	})
+	it("preserves checkout success when the label printer fails", async () => {
+		await mountPOS()
+		saveLabelConfig("Profile 1", { enabled: true, printer: "LABEL" })
+		labelPrintMock.mockRejectedValueOnce(new Error("Label printer offline"))
+		await wrapper.find('[data-test="complete-payment"]').trigger("click")
+		await vi.waitFor(() => expect(wrapper.text()).toContain("Sale completed, but labels could not be printed"))
+		expect(uiStore.showSuccessDialog).toBe(true)
+		expect(uiStore.showErrorDialog).toBe(false)
+		expect(offlineWorkerMock.saveOfflineInvoice).toHaveBeenCalledTimes(1)
+		expect(cartStore.invoiceItems).toHaveLength(0)
+		wrapper.unmount()
+	})
+	it("captures products before an online submission resets the cart and dispatches only after submission", async () => {
+		await mountPOS()
+		offlineStore.isOffline = false
+		saveLabelConfig("Profile 1", { enabled: true, printer: "LABEL" })
+		cartStore.submitInvoice = vi.fn(async () => {
+			expect(labelPrintMock).not.toHaveBeenCalled()
+			cartStore.clearCart()
+			return { name: "POS-ONLINE", status: 1, grand_total: 25000, outstanding_amount: 0, pos_queue_number: 9 }
+		})
+		await wrapper.find('[data-test="complete-payment"]').trigger("click")
+		await vi.waitFor(() => expect(labelPrintMock).toHaveBeenCalledTimes(1))
+		expect(labelPrintMock.mock.calls[0][0]).toMatchObject({ name: "POS-ONLINE", pos_queue_number: 9, items: [expect.objectContaining({ item_name: "Kopi Susu" })] })
+		wrapper.unmount()
+	})
 })
 
 describe("offline checkout double-tap guard (COR-FE-01)", () => {
